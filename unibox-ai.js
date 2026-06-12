@@ -50,35 +50,58 @@ const VAPI = "https://api.vapi.ai";
 
 const status = { startedAt: new Date().toISOString(), lastCheck: null, lastResult: "starting", handled: 0, calls: 0 };
 
-const SYSTEM_PROMPT = `You are the inbox assistant for ${SIGNATURE_NAME} at VocalROI.
-VocalROI sells an AI phone agent for home-service businesses (roofing, HVAC, plumbing).
-The agent answers every call 24/7, books the job, or transfers hot calls to the owner's cell.
-The cold-email offer is a FREE personalized demo: we build an agent with the prospect's company
-name on it and have it CALL them so they can hear it.
+const SYSTEM_PROMPT = `You are ${SIGNATURE_NAME}, the founder of VocalROI, personally replying to leads by email.
+Write like a real, friendly human founder — short, warm, confident, never salesy or robotic.
 
-You read one inbound email reply and decide how to respond. Return ONLY raw JSON (no markdown,
-no code fences) with exactly this shape:
+=== WHAT VOCALROI SELLS ===
+An AI phone agent (voice receptionist) for home-service businesses: roofing, HVAC, plumbing, and similar trades.
+- Answers every inbound call 24/7 — even when the owner is on a roof, under a sink, or asleep.
+- Books the job straight into their calendar, or transfers hot/urgent calls live to the owner's cell.
+- Texts the owner the caller's details. Sounds human, not like a robot.
+
+=== HOW IT WORKS (use this to answer "how does it work?") ===
+- They forward their missed / after-hours / overflow calls to the AI agent. No new phone number, no app, no software to install.
+- The AI greets the caller as their company, answers common questions, collects name/address/phone/issue, and books the appointment — or transfers live if it's urgent.
+- Setup takes minutes. No long contract to try it.
+
+=== WHY IT MATTERS ===
+Home-service businesses miss ~30% of inbound calls (busy on a job, after hours). A missed call = a $1k–$5k job lost to a competitor who picked up. The AI catches those calls.
+
+=== THE OFFER ===
+A FREE personalized demo: we build an AI agent with THEIR company's name on it and have it CALL them so they hear exactly how it sounds answering their phone. No cost, no commitment.
+
+=== PRICING ===
+Never quote hard numbers. It depends on call volume. Always steer to the free demo first — "easiest is to just hear it, then I'll show you exact pricing."
+
+=== YOUR JOB ===
+Read the FULL email thread (it's provided, oldest to newest) and continue the conversation naturally based on where it is.
+Handle whatever the lead is doing right now. Common scenarios:
+- Wants info / "how does it work?" / "tell me more" → answer clearly and briefly using the knowledge above, then offer the free demo.
+- Specific question (pricing, integrations, "is it really AI?", "can it transfer to me?") → answer it directly, then nudge toward the demo.
+- "Show me" / "let me hear it" / "send the demo" / "can I try it?" → they want the demo NOW. If we have their number, tell them their AI agent will call them in the next ~2 minutes. If not, ask for their best cell.
+- Gives a phone number → confirm their AI agent will call them in the next couple minutes so they can hear it.
+- Objection ("too expensive", "we already have someone", "not right now") → handle it warmly, no pressure, leave the door open.
+- Just chatting / said thanks / "cool" after a demo → keep it human, move gently toward a next step (a quick call to set it up).
+- Not interested / unsubscribe / wrong person → close gracefully.
+- Out-of-office / autoresponder / bounce → do not reply.
+
+Return ONLY raw JSON (no markdown, no code fences), exactly this shape:
 {
-  "intent": "interested" | "question" | "not_interested" | "auto_reply" | "unsubscribe" | "other",
+  "stage": "info" | "question" | "wants_demo" | "gave_number" | "objection" | "post_demo" | "not_interested" | "unsubscribe" | "auto_reply" | "other",
   "should_reply": true or false,
-  "reply": "the plain-text reply to send, or empty string if should_reply is false",
-  "phone": "any phone number the lead gave in E.164-ish digits, or empty string",
-  "summary": "one short line describing what the lead said"
+  "reply": "the plain-text email reply, or empty string if should_reply is false",
+  "phone": "the lead's phone number in digits (with country code if given), or empty string",
+  "wants_demo": true or false,
+  "summary": "one short line describing what the lead wants right now"
 }
 
-Rules:
-- "interested" = they want the demo, ask to learn more, give a phone number, or say yes. should_reply true.
-- "question" = they asked something (price, how it works). should_reply true. Answer briefly, then steer to the free demo.
-- "not_interested" = polite no. should_reply true. Reply graciously, leave the door open, no pressure.
-- "unsubscribe" = remove me / stop. should_reply false.
-- "auto_reply" = out-of-office / autoresponder / bounce. should_reply false.
-- Keep replies short (2-4 sentences), warm, human, no corporate fluff, no links.
-- If they're interested but have NOT given a phone number, ask for their best cell so we can build
-  the demo agent and have it call them in the next couple minutes.
-- If they DID give a number, tell them their AI agent will call them in the next couple minutes so they can hear it.
-- Extract any phone number they wrote into "phone" (digits only, with country code if present).
-- Sign every reply exactly as: ${SIGNATURE_NAME}
-- Never invent pricing; if pressed, say it depends on call volume and offer the free demo first.`;
+Reply rules:
+- Keep replies 2-5 sentences, warm and human. No corporate fluff, no links, no bullet lists.
+- Don't repeat what you already said earlier in the thread — move the conversation forward.
+- "wants_demo" = true whenever the lead is ready to experience the demo (asked to see/hear it, said yes to the demo, or gave a number).
+- Put any phone number the lead wrote into "phone".
+- should_reply = false ONLY for unsubscribe, auto_reply/out-of-office, or bounces.
+- Sign every reply exactly as: ${SIGNATURE_NAME}`;
 
 // ---- Helpers ---------------------------------------------------------------
 function loadState() {
@@ -147,12 +170,35 @@ function normalizePhone(raw) {
   return null;
 }
 
-async function classifyAndDraft(email) {
-  const fromName = email.from_address_json?.[0]?.name || email.from_address_email;
-  const userContent = `From: ${fromName} <${email.from_address_email}>
-Subject: ${email.subject}
+const OUR_DOMAINS = ["vocalroi.com", "embermyth.com"];
+const isUs = (addr = "") => OUR_DOMAINS.some((d) => addr.toLowerCase().endsWith("@" + d));
 
-${(email.body?.text || email.content_preview || "").slice(0, 4000)}`;
+// Pull the whole email thread so the agent has conversation memory.
+async function fetchThread(email) {
+  if (!email.thread_id) return [email];
+  try {
+    const data = await instantly(
+      `/emails?search=${encodeURIComponent("thread:" + email.thread_id)}&limit=20`
+    );
+    const items = data.items || [];
+    if (!items.length) return [email];
+    return items.sort((a, b) => new Date(a.timestamp_email) - new Date(b.timestamp_email));
+  } catch {
+    return [email];
+  }
+}
+
+async function classifyAndDraft(email) {
+  const thread = await fetchThread(email);
+  const transcript = thread
+    .map((m) => {
+      const who = isUs(m.from_address_email) ? `US (${SIGNATURE_NAME})` : "LEAD";
+      const text = (m.body?.text || m.content_preview || "").slice(0, 1500).trim();
+      return `${who}:\n${text}`;
+    })
+    .join("\n\n---\n\n");
+
+  const userContent = `Email thread (oldest to newest). Continue the conversation by replying to the LAST message from the LEAD.\n\n${transcript}`;
 
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -163,7 +209,7 @@ ${(email.body?.text || email.content_preview || "").slice(0, 4000)}`;
     },
     body: JSON.stringify({
       model: OPENROUTER_MODEL,
-      max_tokens: 800,
+      max_tokens: 900,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userContent },
@@ -253,17 +299,20 @@ async function checkInbox() {
     const leadEmail = email.from_address_email;
     try {
       const result = await classifyAndDraft(email);
-      const hot = result.intent === "interested" || result.intent === "question";
+      const dead = ["not_interested", "unsubscribe", "auto_reply"].includes(result.stage);
+      const engaged = !dead;
+      const wantsDemo = !!result.wants_demo || result.stage === "wants_demo" || result.stage === "gave_number";
 
       // remember/seed lead record (company/trade come from Instantly lead enrichment if present)
       const lead = (state.leads[leadEmail] = state.leads[leadEmail] || {});
       lead.name = fromName;
       lead.company = lead.company || email.lead?.company_name || guessCompany(leadEmail);
+      lead.stage = result.stage;
 
       const actions = [];
 
-      // 1) create a branded demo assistant the first time a lead shows interest
-      if (hot && CALLING && !lead.assistantId) {
+      // 1) build a branded demo agent the moment the lead wants the demo
+      if (wantsDemo && CALLING && !lead.assistantId) {
         try {
           lead.assistantId = await createDemoAssistant(lead.company, lead.trade, (fromName || "").split(" ")[0]);
           actions.push(`🛠️ Built demo agent for ${lead.company}`);
@@ -272,9 +321,9 @@ async function checkInbox() {
         }
       }
 
-      // 2) if the lead gave a phone number, place the live demo call
+      // 2) place the live demo call once we have a number + a built agent
       const phone = normalizePhone(result.phone);
-      if (phone && CALLING && lead.assistantId && !lead.demoCalled) {
+      if (phone && wantsDemo && CALLING && lead.assistantId && !lead.demoCalled) {
         try {
           await placeDemoCall(lead.assistantId, phone, lead.company);
           lead.demoCalled = true;
@@ -296,23 +345,23 @@ async function checkInbox() {
           actionLine = "📝 Draft ready (AUTO_SEND off)";
         }
       } else {
-        actionLine = "⏭️ No reply (" + result.intent + ")";
+        actionLine = "⏭️ No reply (" + result.stage + ")";
       }
 
-      if (hot || result.should_reply) {
-        const flag = hot ? "🔥 INTERESTED LEAD" : "📩 New reply";
+      if (engaged || result.should_reply) {
+        const flag = wantsDemo ? "🔥 DEMO-READY LEAD" : "📩 Lead reply";
         await telegram(
           `${flag}\n\n` +
             `<b>${escapeHtml(fromName)}</b> — ${escapeHtml(lead.company || "")}\n` +
             `${escapeHtml(leadEmail)}\n\n` +
             `<b>They said:</b> ${escapeHtml(result.summary)}\n` +
-            `<b>Intent:</b> ${result.intent}\n` +
+            `<b>Stage:</b> ${escapeHtml(result.stage)}\n` +
             `<b>${actionLine}</b>\n` +
             (actions.length ? actions.map((a) => "• " + escapeHtml(a)).join("\n") + "\n" : "") +
             (result.reply ? `\n<b>Reply:</b>\n${escapeHtml(result.reply)}` : "")
         );
       }
-      console.log(`  • ${fromName}: ${result.intent} — ${actionLine} ${actions.join(" | ")}`);
+      console.log(`  • ${fromName}: ${result.stage} — ${actionLine} ${actions.join(" | ")}`);
     } catch (err) {
       console.error(`  ! Error on ${fromName}:`, err.message);
       await telegram(
