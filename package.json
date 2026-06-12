@@ -1,0 +1,14 @@
+{
+  "name": "vocalroi-unibox-ai",
+  "version": "1.0.0",
+  "description": "AI auto-responder + Telegram alerts for interested leads in the Instantly Unibox (OpenRouter)",
+  "type": "module",
+  "main": "unibox-ai.js",
+  "scripts": {
+    "start": "node unibox-ai.js",
+    "once": "node unibox-ai.js --once"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
