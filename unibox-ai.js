@@ -7,7 +7,7 @@
 // State lives in processed.json so nothing is handled (or called) twice.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { createServer } from "node:http";
 import "dotenv/config";
@@ -50,7 +50,7 @@ const VAPI = "https://api.vapi.ai";
 
 const status = { startedAt: new Date().toISOString(), lastCheck: null, lastResult: "starting", handled: 0, calls: 0 };
 
-const SYSTEM_PROMPT = `You are ${SIGNATURE_NAME}, the founder of VocalROI, personally replying to leads by email.
+export const SYSTEM_PROMPT = `You are ${SIGNATURE_NAME}, the founder of VocalROI, personally replying to leads by email.
 Write like a real, friendly human founder — short, warm, confident, never salesy or robotic.
 
 === WHAT VOCALROI SELLS ===
@@ -135,7 +135,7 @@ async function api(base, key, path, options = {}) {
   return res.status === 204 ? {} : res.json();
 }
 const instantly = (path, options) => api(INSTANTLY, INSTANTLY_API_KEY, path, options);
-const vapi = (path, options) => api(VAPI, VAPI_PRIVATE_KEY, path, options);
+export const vapi = (path, options) => api(VAPI, VAPI_PRIVATE_KEY, path, options);
 
 async function telegram(text) {
   const res = await fetch(
@@ -188,7 +188,7 @@ async function fetchThread(email) {
   }
 }
 
-async function classifyAndDraft(email) {
+export async function classifyAndDraft(email) {
   const thread = await fetchThread(email);
   const transcript = thread
     .map((m) => {
@@ -200,25 +200,40 @@ async function classifyAndDraft(email) {
 
   const userContent = `Email thread (oldest to newest). Continue the conversation by replying to the LAST message from the LEAD.\n\n${transcript}`;
 
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "X-Title": "VocalROI Unibox AI",
-    },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL,
-      max_tokens: 900,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const data = await res.json();
-  return extractJson(data.choices?.[0]?.message?.content || "");
+  // Free models are inconsistent at JSON, so force json mode and retry a few times.
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "X-Title": "VocalROI Unibox AI",
+        },
+        body: JSON.stringify({
+          model: OPENROUTER_MODEL,
+          max_tokens: 900,
+          temperature: 0.4,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: userContent + (attempt > 0 ? "\n\nIMPORTANT: respond with ONLY the JSON object, nothing before or after." : ""),
+            },
+          ],
+        }),
+      });
+      if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content || "";
+      return extractJson(content);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("classify failed after retries");
 }
 
 async function sendReply(email, replyText) {
@@ -234,7 +249,7 @@ async function sendReply(email, replyText) {
 }
 
 // Create a Vapi voice assistant branded for this lead's company.
-async function createDemoAssistant(company, trade, ownerFirst) {
+export async function createDemoAssistant(company, trade, ownerFirst) {
   const co = company || "your company";
   const t = trade || "home services";
   const assistant = await vapi("/assistant", {
@@ -430,4 +445,7 @@ async function main() {
   );
 }
 
-main();
+// Only run the watcher when executed directly (not when imported by the tester).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}
